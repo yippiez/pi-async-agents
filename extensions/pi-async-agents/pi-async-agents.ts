@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -45,8 +44,6 @@ interface AsyncJob {
   status: JobStatus;
   cwd: string;
   parentSessionFile?: string;
-  sessionId: string;
-  sessionFile?: string;
   startedAt: number;
   endedAt?: number;
   finalText?: string;
@@ -77,10 +74,6 @@ interface Theme {
 
 function makeId(): string {
   return `async-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function sanitizeSessionId(id: string): string {
-  return id.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || `async-${Date.now().toString(36)}`;
 }
 
 function formatDuration(ms: number): string {
@@ -167,23 +160,6 @@ function messageForMain(job: AsyncJob): string {
   return [`Async agent '${job.name}' finished.`, "", markerStripped || "(no final output)"].join("\n");
 }
 
-function readLastAssistantText(sessionFile: string | undefined): string | undefined {
-  if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
-  const lines = fs.readFileSync(sessionFile, "utf8").trim().split("\n").reverse();
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
-      const text = textFromMessage(entry.message);
-      if (text) return text;
-    } catch {
-      /* ignore malformed line */
-    }
-  }
-  return undefined;
-}
-
 function circle(status: JobStatus, theme: Theme): string {
   const color = status === "failed" ? "error" : status === "needs_input" ? "warning" : status === "canceled" ? "dim" : status === "done" ? "accent" : "muted";
   return theme.fg(color, "○");
@@ -213,8 +189,8 @@ function snapshotJob(job: AsyncJob) {
     status: job.status,
     cwd: job.cwd,
     parentSessionFile: job.parentSessionFile,
-    sessionId: job.sessionId,
-    sessionFile: job.sessionFile,
+    sessionId: undefined,
+    sessionFile: undefined,
     startedAt: job.startedAt,
     endedAt: job.endedAt,
     finalText: job.finalText,
@@ -263,7 +239,7 @@ export default function asyncAgents(pi: ExtensionAPI) {
   }
 
   async function postResultToMain(job: AsyncJob) {
-    if (job.postedResult || job.status === "canceled") return;
+    if (job.postedResult || job.status === "canceled" || job.status === "failed") return;
     try {
       await (pi.sendUserMessage as any)(messageForMain(job), { deliverAs: "followUp" });
       job.postedResult = true;
@@ -329,7 +305,6 @@ export default function asyncAgents(pi: ExtensionAPI) {
       status: "queued",
       cwd: request.cwd ?? ctx.cwd,
       parentSessionFile,
-      sessionId: sanitizeSessionId(id),
       startedAt: Date.now(),
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
       lastActions: [],
@@ -342,9 +317,8 @@ export default function asyncAgents(pi: ExtensionAPI) {
     emitUpdate(pi, job);
     updateWidget();
 
-    const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", request.tools ?? DEFAULT_TOOLS, "--append-system-prompt", buildSystemAppend(job), "--session-id", job.sessionId, "--name", job.name, "--approve"];
+    const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", request.tools ?? DEFAULT_TOOLS, "--append-system-prompt", buildSystemAppend(job), "--name", job.name, "--approve"];
     if (request.model) args.push("--model", request.model);
-    if (parentSessionFile) args.push("--fork", parentSessionFile);
 
     const invocation = getPiInvocation(args);
     const proc = spawn(invocation.command, invocation.args, {
@@ -370,7 +344,6 @@ export default function asyncAgents(pi: ExtensionAPI) {
       for (const pending of job.pending.values()) pending.reject(new Error("Async agent exited"));
       job.pending.clear();
       if (job.status === "queued" || job.status === "running") {
-        if (!job.finalText) job.finalText = readLastAssistantText(job.sessionFile);
         job.endedAt = Date.now();
         if (code === 0 && job.finalText) {
           job.status = classifyFinal(job.finalText);
@@ -385,12 +358,6 @@ export default function asyncAgents(pi: ExtensionAPI) {
       updateWidget();
     });
 
-    try {
-      const state = await sendRpc(job, "get_state");
-      job.sessionFile = state?.sessionFile;
-    } catch {
-      /* ignore */
-    }
     await sendRpc(job, "prompt", { message: buildPrompt(job) });
     return job;
   }
