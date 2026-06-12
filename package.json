@@ -1,0 +1,15 @@
+{
+  "name": "pi-async-agents",
+  "version": "0.1.0",
+  "description": "Background pure RPC async agents for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "async", "agents", "extension"],
+  "license": "MIT",
+  "files": ["extensions", "README.md"],
+  "pi": {
+    "extensions": ["./extensions/pi-async-agents/pi-async-agents.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
