@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -160,6 +161,23 @@ function finalForMain(job: AsyncJob): string {
     .replace(/\n?ASYNC_AGENT_DONE\s*$/i, "")
     .trim();
   return [`Async agent '${job.name}' finished.`, "", markerStripped || "(no final output)"].join("\n");
+}
+
+function readLastAssistantText(sessionFile: string | undefined): string | undefined {
+  if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
+  const lines = fs.readFileSync(sessionFile, "utf8").trim().split("\n").reverse();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+      const text = textFromMessage(entry.message);
+      if (text) return text;
+    } catch {
+      /* ignore malformed line */
+    }
+  }
+  return undefined;
 }
 
 function circle(status: JobStatus, theme: Theme): string {
@@ -337,10 +355,16 @@ export default function asyncAgents(pi: ExtensionAPI) {
       if (job.stdoutBuffer.trim()) handleRpcLine(job, job.stdoutBuffer);
       for (const pending of job.pending.values()) pending.reject(new Error("Async agent exited"));
       job.pending.clear();
-      if ((job.status === "queued" || job.status === "running") && code !== 0) {
-        job.status = "failed";
+      if (job.status === "queued" || job.status === "running") {
+        if (!job.finalText) job.finalText = readLastAssistantText(job.sessionFile);
         job.endedAt = Date.now();
-        job.errorText = job.errorText || `Process exited with code ${code ?? "unknown"}`;
+        if (code === 0 && job.finalText) {
+          job.status = classifyFinal(job.finalText);
+          void postResultToMain(job);
+        } else if (code !== 0) {
+          job.status = "failed";
+          job.errorText = job.errorText || `Process exited with code ${code ?? "unknown"}`;
+        }
       }
       emitUpdate(pi, job);
       updateWidget();
