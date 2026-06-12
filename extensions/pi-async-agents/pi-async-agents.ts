@@ -58,6 +58,7 @@ interface AsyncJob {
   pending: Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>;
   requestSeq: number;
   postedResult: boolean;
+  removalTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface ForkRequest {
@@ -156,7 +157,10 @@ function classifyFinal(text: string): JobStatus {
   return /NEEDS_INPUT:/i.test(text) ? "needs_input" : "done";
 }
 
-function finalForMain(job: AsyncJob): string {
+function messageForMain(job: AsyncJob): string {
+  if (job.status === "failed") {
+    return [`Async agent '${job.name}' failed.`, "", job.errorText || "(no error details)"].join("\n");
+  }
   const markerStripped = (job.finalText ?? "")
     .replace(/\n?ASYNC_AGENT_DONE\s*$/i, "")
     .trim();
@@ -189,7 +193,7 @@ function renderJobLine(job: AsyncJob, theme: Theme, width: number): string {
   const elapsed = formatDuration((job.endedAt ?? Date.now()) - job.startedAt);
   const usage = `↑${formatTokens(job.usage.input)} ↓${formatTokens(job.usage.output)} $${job.usage.cost.toFixed(4)}`;
   const raw = `${job.name} ${job.status} ${elapsed} ${usage} ${job.task}`;
-  return truncateToWidth(`${circle(job.status, theme)} ${raw}`, width);
+  return truncateToWidth(`${circle(job.status, theme)} ${theme.fg("muted", raw)}`, width);
 }
 
 function renderWidget(jobs: AsyncJob[], theme: Theme, width: number): string[] {
@@ -249,13 +253,23 @@ export default function asyncAgents(pi: ExtensionAPI) {
     });
   }
 
+  function scheduleRemoval(job: AsyncJob) {
+    if (job.removalTimer) clearTimeout(job.removalTimer);
+    job.removalTimer = setTimeout(() => {
+      jobs.delete(job.id);
+      emitUpdate(pi, job);
+      updateWidget();
+    }, 3000);
+  }
+
   async function postResultToMain(job: AsyncJob) {
-    if (job.postedResult || job.status === "canceled" || job.status === "failed") return;
-    job.postedResult = true;
+    if (job.postedResult || job.status === "canceled") return;
     try {
-      await (pi.sendUserMessage as any)(finalForMain(job), { deliverAs: "followUp" });
+      await (pi.sendUserMessage as any)(messageForMain(job), { deliverAs: "followUp" });
+      job.postedResult = true;
+      scheduleRemoval(job);
     } catch {
-      /* ignore */
+      /* keep terminal status visible if the message was not accepted */
     }
   }
 
@@ -364,6 +378,7 @@ export default function asyncAgents(pi: ExtensionAPI) {
         } else if (code !== 0) {
           job.status = "failed";
           job.errorText = job.errorText || `Process exited with code ${code ?? "unknown"}`;
+          void postResultToMain(job);
         }
       }
       emitUpdate(pi, job);
