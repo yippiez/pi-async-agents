@@ -203,10 +203,15 @@ function snapshotJob(job: AsyncJob) {
 export default function asyncAgents(pi: ExtensionAPI) {
   const jobs = new Map<string, AsyncJob>();
   let activeCtx: ExtensionContext | undefined;
+  let panelOpen = false;
 
   function updateWidget() {
     const ctx = activeCtx;
     if (!ctx?.hasUI || ctx.mode !== "tui") return;
+    if (panelOpen) {
+      ctx.ui.setWidget("pi-async-agents", undefined);
+      return;
+    }
     const visibleJobs = [...jobs.values()].filter((job) => job.status !== "canceled");
     if (visibleJobs.length === 0) {
       ctx.ui.setWidget("pi-async-agents", undefined);
@@ -382,45 +387,68 @@ export default function asyncAgents(pi: ExtensionAPI) {
 
   function showPanel(ctx: ExtensionContext) {
     if (!ctx.hasUI || ctx.mode !== "tui") return;
-    const list = () => [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+    const list = () => [...jobs.values()].filter((j) => j.status !== "canceled").sort((a, b) => b.startedAt - a.startedAt);
     if (list().length === 0) {
       ctx.ui.notify("No async agents", "info");
       return;
     }
 
+    // Suppress the inline status widget while the panel is open. The panel
+    // replaces the editor with its own prompt-bar-style component.
+    panelOpen = true;
+    updateWidget();
+    const restoreWidget = () => {
+      panelOpen = false;
+      updateWidget();
+    };
     void ctx.ui.custom<void>((tui, theme: Theme, _kb, done) => {
+      const close = (value: void | undefined) => { restoreWidget(); done(value); };
       let selected = 0;
-      let expanded = true;
-      const render = (width: number) => {
+      let expanded = false;
+      let refreshTimer: ReturnType<typeof setInterval> | undefined;
+
+      const headerLine = () => theme.fg("error", "Async agents");
+      const footerLine = () => theme.fg("dim", "↑/↓ select · enter expand · s steer · x stop · d delete · esc close");
+
+      const buildLines = (width: number): string[] => {
         const current = list();
         selected = Math.max(0, Math.min(selected, current.length - 1));
-        const lines: string[] = [theme.fg("accent", theme.bold("Async agents")), ""];
+        const lines: string[] = [headerLine(), ""];
         current.forEach((job, index) => {
-          const prefix = index === selected ? theme.fg("accent", "› ") : "  ";
-          lines.push(prefix + renderJobLine(job, theme, Math.max(1, width - 2)));
+          const marker = index === selected ? theme.fg("accent", "›") : " ";
+          lines.push(`${marker} ${renderJobLine(job, theme, Math.max(1, width - 2))}`);
         });
         const job = current[selected];
         if (job && expanded) {
-          lines.push("", theme.fg("dim", "Last actions"));
-          for (const action of job.lastActions.slice(-6)) lines.push(truncateToWidth(`  ${action}`, width));
+          lines.push("", theme.fg("text", `Selected: ${job.name}`));
+          if (job.lastActions.length > 0) {
+            lines.push(theme.fg("dim", "Last actions"));
+            for (const action of job.lastActions.slice(-4)) lines.push(truncateToWidth(`  ${action}`, width));
+          }
           if (job.finalText) {
-            lines.push("", theme.fg("dim", "Final"));
-            for (const line of job.finalText.split("\n").slice(0, 8)) lines.push(truncateToWidth(`  ${line}`, width));
+            lines.push(theme.fg("dim", "Final"));
+            for (const line of job.finalText.split("\n").slice(0, 6)) lines.push(truncateToWidth(`  ${line}`, width));
           }
           if (job.errorText) {
-            lines.push("", theme.fg("error", "Error"));
+            lines.push(theme.fg("error", "Error"));
             for (const line of job.errorText.split("\n").slice(-4)) lines.push(truncateToWidth(`  ${line}`, width));
           }
         }
-        lines.push("", theme.fg("dim", "↑/↓ select · enter expand · s steer · x stop · d delete · esc close"));
+        lines.push("", footerLine());
         return lines.map((line) => truncateToWidth(line, width));
       };
+
       return {
-        render,
-        invalidate() {},
-        handleInput(data: string) {
+        render(width: number): string[] {
+          return buildLines(width);
+        },
+        invalidate(): void {},
+        dispose(): void {
+          if (refreshTimer) clearInterval(refreshTimer);
+        },
+        handleInput(data: string): void {
           const current = list();
-          if (matchesKey(data, "escape")) return done(undefined);
+          if (matchesKey(data, "escape")) return close(undefined);
           if (matchesKey(data, "up")) selected = Math.max(0, selected - 1);
           else if (matchesKey(data, "down")) selected = Math.min(current.length - 1, selected + 1);
           else if (matchesKey(data, "enter")) expanded = !expanded;
@@ -441,14 +469,14 @@ export default function asyncAgents(pi: ExtensionAPI) {
           tui.requestRender();
         },
       };
-    }, { overlay: true, overlayOptions: { width: "80%", maxHeight: "80%", anchor: "center" } });
+    }, { overlay: false });
   }
 
   pi.on("input", async (event, ctx) => {
     if (event.source !== "interactive") return { action: "continue" };
-    const match = event.text.match(/^\/fork\s+([\s\S]+)$/);
+    const match = event.text.match(/^\/fork(?:\s+([\s\S]+))?$/);
     if (!match) return { action: "continue" };
-    const task = match[1]!.trim();
+    const task = (match[1] ?? "").trim();
     if (!task) return { action: "continue" };
     await launch({ task }, ctx);
     return { action: "handled" };
